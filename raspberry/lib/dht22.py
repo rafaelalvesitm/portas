@@ -35,7 +35,7 @@ from lib.mqtt_client import MqttClient
 class DHT22():
     def __init__(self, mqtt_client, sensor_key, sensor_id):
         # --- Set environement file --- 
-        self.dotenv_file = "/home/lab/Desktop/portas/.env"
+        self.dotenv_file = ".env"
         
         # --- Sensor Attributes as defined in the IoT Agent JSON ---
         self.sensor_key = sensor_key  # API Key from IoT Agent JSON
@@ -110,7 +110,7 @@ class DHT22():
         logging.debug(f"Saving data to sqlite {self.sensor_id}")
         # Create table
         try:
-            conn = sqlite3.connect("/home/lab/Desktop/rasp-top/data-top.db")
+            conn = sqlite3.connect("./data.db")
             cur = conn.cursor()
             table_name = f"`{self.sensor_id}`"
             cur.execute(

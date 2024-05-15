@@ -26,14 +26,13 @@ import sqlite3
 import logging
 import os
 import dotenv
+import Adafruit_ADS1x15
 import RPi.GPIO as GPIO
 
-# from lib.mqtt_client import MqttClient
+from lib.mqtt_client import MqttClient
 
-
-class Pump():
+class Moisture():
     def __init__(self, mqtt_client, sensor_key, sensor_id):
-        
         # --- Set environement file --- 
         self.dotenv_file = ".env"
         
@@ -42,18 +41,20 @@ class Pump():
         self.sensor_id = sensor_id  # API Key from IoT Agent JSON
 
         # Sensor Attributes as defined in the IoT Agent JSON
-        self.onInterval = int(os.environ.get(f"{self.sensor_id}_onInterval", "5"))
-        self.offInterval = int(os.environ.get(f"{self.sensor_id}_offInterval", "10"))
-        self.status = os.environ.get(f"{self.sensor_id}_status", "off") 
+        self.collectInterval = int(
+            os.environ.get(f"{self.sensor_id}_collectInterval", "5")
+        )
+        self.moisture = None  # Moisture data
 
         # MQTT Topics as defined in the IoT Agent JSON
         self.attrs_topic = f"/json/{self.sensor_key}/{self.sensor_id}/attrs"
         self.cmd_topic = f"/{self.sensor_key}/{self.sensor_id}/cmd"
-        
-        # --- Device attributes need for the GPIO library ---
-        self.pin = int(os.environ.get(f"{self.sensor_id}_PIN", "17"))
-        GPIO.setmode(GPIO.BCM)
-        GPIO.setup(self.pin, GPIO.OUT)
+
+        # Sensor attributes need for the Adafruit_DHT library
+        self.sensor = Adafruit_ADS1x15.ADS1115()
+        # Set the gain to ±4.096V (adjust if needed)
+        self.GAIN = os.environ.get(f"{self.sensor_id}_GAIN", "1")
+        self.PIN = os.environ.get(f"{self.sensor_id}_PIN", "3")
 
         # --- MQTT Client Inheritence ---
         # super().__init__()
@@ -62,62 +63,43 @@ class Pump():
         self.mqtt_client.subscribe(self.cmd_topic)
         self.mqtt_client.message_callback_add(self.cmd_topic, self.receive_commands)
 
-    # --- Magic Methods ---
     def __dir__(self):
         return {
-            "sensor_key": self.sensor_key,
             "sensor_id": self.sensor_id,
-            "onInterval": self.onInterval,
-            "offInterval": self.offInterval,
-            "status": self.status,
+            "timestamp": time.time(),
+            "moisture": self.moisture,
+            "collectInterval": self.collectInterval,
         }
 
+    # --- MQTT Callbacks ---
     def receive_commands(self, client, userdata, message):
         payload = json.loads(message.payload.decode())
         logging.info("Received command: %s", payload)
 
-        if payload.get("setOnInterval"):
-            self.update_on_interval(payload.get("setOnInterval"))
-        elif payload.get("setOffInterval"):
-            self.update_off_interval(payload.get("setOffInterval"))
+        if payload.get("setCollectInterval"):
+            self.update_collect_interval(payload["setCollectInterval"])
 
-    def update_on_interval(self, onInterval):
-        self.onInterval = onInterval
-        dotenv.set_key(self.dotenv_file, f"{self.sensor_id}_onInterval", str(self.onInterval))
-
-        logging.info("Device: {self.sensor_id} | On interval updated to {self.onInterval}")
-        data = {
-            "on": self.onInterval,
-            "setOnInterval_info": f"Updated to {self.onInterval} seconds",
-            "setOnInterval_status": "OK",
-        }
-        payload = json.dumps(data)
-        self.mqtt_client.publish(self.attrs_topic, payload)
-
-    def update_off_interval(self, offInterval):
-        logging.debug(
-            f"Device: {self.sensor_id} | On interval updated to {self.offInterval}"
+    def update_collect_interval(self, collectInterval):
+        self.collectInterval = collectInterval
+        dotenv.set_key(
+            self.dotenv_file, f"{self.sensor_id}_collectInterval", str(self.collectInterval)
         )
-        self.offInterval = offInterval
-        dotenv.set_key(self.dotenv_file, f"{self.sensor_id}_offInterval", str(self.offInterval))
-
+        # Send the response to the MQTT Broker
         data = {
-            "off": self.offInterval,
-            "setOffInterval_info": f"Updated to {self.offInterval} seconds",
-            "setOffInterval_status": "OK",
+            "ci": self.collectInterval,
+            "setCollectInterval_info": f"Updated to {self.collectInterval} seconds",
+            "setCollectInterval_status": "OK",
         }
         payload = json.dumps(data)
         self.mqtt_client.publish(self.attrs_topic, payload)
 
-    # --- Main device methods
-    def actuate(self):
-        logging.debug(f"Actuating {self.sensor_id}")
-        if self.status == "on":
-            # Turn the pump on
-            GPIO.output(self.pin, GPIO.HIGH)
-        elif self.status == "off":
-            # Turn the pump off
-            GPIO.output(self.pin, GPIO.LOW)
+    # --- Main sensor Methods ---
+    def read_data(self):
+        logging.debug(f"Reading data from {self.sensor_id}")
+        try:
+            self.moisture = self.sensor.read_adc(int(self.PIN), gain=int(self.GAIN))
+        except Exception as e:
+            logging.error(f"Device: {self.sensor_id} | Read data | Error: {e}")
 
     def save_data(self):
         logging.debug(f"Saving data to sqlite {self.sensor_id}")
@@ -130,12 +112,13 @@ class Pump():
                 f"""CREATE TABLE IF NOT EXISTS {table_name} (
                     id INTEGER PRIMARY KEY AUTOINCREMENT, 
                     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    status TEXT
+                    moisture REAL
                 )"""
             )
             cur.execute(
-                f"INSERT INTO {table_name} (status) VALUES (?)", (self.status,)
-                )
+                f"INSERT INTO {table_name} (moisture) VALUES (?)",
+                (int(self.moisture),),
+            )
             conn.commit()
             conn.close()
         except Exception as e:
@@ -144,27 +127,22 @@ class Pump():
     def send_data(self):
         logging.debug(f"Sending data to MQTT {self.sensor_id}")
         try:
-            message = {
-                "s": self.status, 
-                "on": self.onInterval,
-                "off": self.offInterval,
-                "timestamp": time.time()
-            }
-            payload = json.dumps(message)
-            self.mqtt_client.publish(self.attrs_topic, payload)
+            if self.moisture is not None:
+                message = {
+                    "m": self.moisture,
+                    "ci": self.collectInterval,
+                    "timestamp": time.time(),
+                }
+                payload = json.dumps(message)
+                self.mqtt_client.publish(self.attrs_topic, payload)
         except Exception as e:
             logging.error(f"Device: {self.sensor_id} | Send to MQTT | Error: {e}")
 
     # --- Main Loop ---
     def run(self):
         while True:
-            logging.info(f"Pump object: {self.__dir__()}")
-            self.actuate()
+            self.read_data()
             self.save_data()
             self.send_data()
-            if self.status == "on":
-                time.sleep(self.onInterval)
-                self.status = "off"
-            elif self.status == "off":
-                time.sleep(self.offInterval)
-                self.status = "on"
+            logging.info(f"Moisture object: {self.__dir__()}")
+            time.sleep(self.collectInterval)

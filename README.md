@@ -1,6 +1,6 @@
 # FEI Portas Abertas
 
-Apresentação de um pequeno dispsoitov 
+Apresentação de um pequeno dispsoito para demonstração das funcionalidades de um sistema de Internet das Coisas. 
 
 # Prótipo
 

@@ -1,144 +1,206 @@
-# docker-compose.yml
-#
-# This docker-compose file is configured for a local teaching environment.
-# It is not intended for production use.
+# -------------------------------------------------------------------------------------------
+# FIWARE PLATFORM - DOCKER COMPOSE ESTRUTURADO (BOAS PRÁTICAS)
+# -------------------------------------------------------------------------------------------
+# Este arquivo foi otimizado para desenvolvimento e demonstração, incluindo:
+# - Rotação de logs para economia de disco.
+# - Limites de recursos (RAM/CPU) para estabilidade do host.
+# - Organização em camadas (Database, Core, IoT, Apps).
+# -------------------------------------------------------------------------------------------
+
+# Definições Comuns (Anchors) para evitar repetição
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-resource-limits: &default-limits
+  deploy:
+    resources:
+      limits:
+        cpus: '0.50'
+        memory: 2GB
 
 services:
+  # =========================================================================================
+  # CAMADA DE DADOS (DATABASES)
+  # =========================================================================================
+  
+  mongo-db:
+    image: mongo:6.0
+    hostname: mongo-db
+    container_name: db-mongo
+    restart: always
+    expose:
+      - "27017"
+    ports:
+      - "27017:27017"
+    networks:
+      - fiware-network
+    volumes:
+      - mongo-db:/data/db
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+    healthcheck:
+      test: ["CMD","mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
-# --- Provedor de contexto ---
+  mysql-db:
+    image: mysql:8.0
+    platform: linux/amd64
+    hostname: mysql-db
+    container_name: db-mysql
+    restart: always
+    expose:
+      - "3306"
+    ports:
+      - "3306:3306"
+    networks:
+      - fiware-network
+    environment:
+      - "MYSQL_ROOT_PASSWORD=123"
+      - "MYSQL_ROOT_HOST=%"
+    volumes:
+      - mysql-db:/var/lib/mysql
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
 
-  # Orion Context Broker é o principal componente do FIWARE
-  orion:
-    image: fiware/orion:4.2.0
+  # =========================================================================================
+  # FIWARE CORE (CONTEXT BROKER & PERSISTENCE)
+  # =========================================================================================
+
+  orion-v2:
+    image: quay.io/fiware/orion:4.1.0
     hostname: orion
     container_name: fiware-orion
     depends_on:
       - mongo-db
-    restart: unless-stopped
-    expose:
-      - "1026"
-    ports:
-      - "1026:1026"
-    command: -dbURI mongodb://mongo-db -logLevel WARN -noCache # Nível de log alterado para WARN
-    volumes:
-      - orion-log:/var/log/orion
-    healthcheck:
-      test: curl --fail -s http://orion:1026/version || exit 1
-      interval: 5s
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-    # Adicionando à rede
     networks:
       - fiware-network
+    ports:
+      - "1026:1026"
+    command: -dbURI mongodb://mongo-db -logLevel DEBUG -noCache
+    logging: *default-logging
+    <<: *default-limits
+    healthcheck:
+      test: curl --fail -s http://orion:1026/version || exit 1
+      interval: 10s
 
-# --- Agentes e interfaces de dispositivos ---
-
-  # IoT Agent JSON é um agente que conecta dispositivos IoT ao Orion Context Broker
-  iot-agent-json:
-    image: fiware/iotagent-json:3.5.0
-    hostname: iot-agent-json
-    container_name: fiware-iot-agent-json
+  cygnus:
+    image: quay.io/fiware/cygnus-ngsi:3.11.0
+    hostname: cygnus
+    container_name: fiware-cygnus
     depends_on:
+      - mysql-db
+    networks:
+      - fiware-network
+    ports:
+      - "5050:5050"
+      - "5080:5080"
+    environment:
+      - "CYGNUS_MYSQL_SERVICE_PORT=5050"
+      - "CYGNUS_MYSQL_HOST=mysql-db"
+      - "CYGNUS_MYSQL_PORT=3306"
+      - "CYGNUS_MYSQL_USER=root"
+      - "CYGNUS_MYSQL_PASS=123"
+      - "CYGNUS_SERVICE_PORT=5050"
+      - "CYGNUS_API_PORT=5080"
+      - "CYGNUS_LOG_LEVEL=DEBUG"
+    logging: *default-logging
+    <<: *default-limits
+    healthcheck:
+      test: curl --fail -s http://localhost:5080/v1/version || exit 1
+
+  # =========================================================================================
+  # IOT LAYER (AGENTS)
+  # =========================================================================================
+
+  iot-agent:
+    image: quay.io/fiware/iotagent-ul:3.7.0-distroless
+    hostname: iot-agent
+    container_name: fiware-iot-agent
+    depends_on:
+      - orion-v2
       - mongo-db
-      - mosquitto
-    restart: unless-stopped
-    expose:
-      - "4041"
-      - "7896"
+    networks:
+      - fiware-network
     ports:
       - "4041:4041"
       - "7896:7896"
     environment:
-      - "IOTA_CB_HOST=orion"
-      - "IOTA_CB_PORT=1026"
-      - "IOTA_NORTH_PORT=4041"
-      - "IOTA_REGISTRY_TYPE=mongo-db"
-      - "IOTA_TIMESTAMP=true" 
-      - "IOTA_CB_NGSI_VERSION=v2" 
-      - "IOTA_MONGO_HOST=mongo-db"
-      - "IOTA_MONGO_PORT=27017"
-      - "IOTA_MONGO_DB=iotagentjson"
-      - "IOTA_HTTP_PORT=7896"
-      - "IOTA_PROVIDER_URL=http://iot-agent-json:4041"
-      - "IOTA_MQTT_HOST=mosquitto"
-      - "IOTA_MQTT_PORT=1883"
-      - "IOTA_LOG_LEVEL=WARN" # Nível de log definido como WARN
-      - "IOTA_host_TRANSPORT=MQTT"
+      - IOTA_CB_HOST=orion
+      - IOTA_CB_PORT=1026
+      - IOTA_NORTH_PORT=4041
+      - IOTA_REGISTRY_TYPE=mongodb
+      - IOTA_LOG_LEVEL=DEBUG
+      - IOTA_TIMESTAMP=true
+      - IOTA_CB_NGSI_VERSION=v2
+      - IOTA_AUTOCAST=true
+      - IOTA_MONGO_HOST=mongo-db
+      - IOTA_MONGO_PORT=27017
+      - IOTA_MONGO_DB=iotagentul
+      - IOTA_HTTP_PORT=7896
+      - IOTA_PROVIDER_URL=http://iot-agent:4041
+      - IOTA_MULTI_CORE=true
+      - IOTA_AMQP_DISABLED=true
+      - IOTA_MQTT_DISABLED=false
+      - IOTA_MQTT_HOST=mosquitto
+      - IOTA_MQTT_PORT=1883
+    logging: *default-logging
+    <<: *default-limits
     healthcheck:
-      test: curl --fail -s http://iot-agent-json:4041/iot/about || exit 1
-      interval: 5s
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-    # Adicionando à rede
+      interval: 10s
+      test: curl --fail -s http://localhost:4041/iot/about || exit 1
+
+  mosquitto:
+    image: eclipse-mosquitto:2.0
+    hostname: mosquitto
+    container_name: fiware-mosquitto
+    restart: always
     networks:
       - fiware-network
-
-  # Eclipse Mosquitto é um broker MQTT que conecta dispositivos IoT ao IoT Agent JSON
-  mosquitto:
-    image: eclipse-mosquitto:2.0.18
-    hostname: mosquitto
-    container_name: mosquitto
-    restart: unless-stopped
-    expose:
-      - "1883"
     ports:
       - "1883:1883"
-    volumes:
-      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf
-      - mosquitto-data:/mosquitto/data
-      - mosquitto-log:/mosquitto/log
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-    # Removendo 'default' e adicionando a nova rede
-    networks:
-      - fiware-network
-
-# --- Banco de Dados ---
-
-  # MongoDB é um banco de dados NoSQL usado para armazenar dados do Orion Context Broker, IoT Agent JSON e Cygnus
-  mongo-db:
-    image: mongo:6.0
-    hostname: mongo-db 
-    container_name: mongo-db
-    restart: unless-stopped
-    expose:
-      - "27017" 
-    ports:
-      - "27017:27017" 
-    volumes:
-      - mongo-db:/data/db
+      - "9001:9001"
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 128M
     healthcheck:
-      test: ["CMD","mongosh", "--eval", "db.adminCommand('ping')"]
-      interval: 30s
-      timeout: 30s
+      test: ["CMD", "mosquitto_sub", "-h", "localhost", "-t", "test", "-C", "1"]
+      interval: 10s
+      timeout: 5s
       retries: 3
-      start_period: 30s
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-    # Adicionando à rede
-    networks:
-      - fiware-network
-# --- Volumes ---
 
-volumes: # Creates a volume to persit the data in the database
-  mongo-db: 
-  orion-log:
-  mosquitto-data:
-  mosquitto-log:
+# =========================================================================================
+# INFRAESTRUTURA DE REDE E VOLUMES
+# =========================================================================================
 
-# --- Redes ---
 networks:
   fiware-network:
-    driver: bridge # O padrão bridge é adequado para comunicação em uma única máquina.
+    name: fiware_network
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.18.1.0/24
+
+volumes:
+  mongo-db:
+    name: fiware_mongo_data
+  mysql-db:
+    name: fiware_mysql_data

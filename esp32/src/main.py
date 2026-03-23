@@ -6,91 +6,124 @@ import machine
 from libs.wifi import WiFiConnector
 from libs.mqtt import MQTTConnector
 from libs.dht22 import DHT22Sensor
+from libs.ldr import LDRSensor
+from libs.pir import PIRSensor
+from libs.relay import RelayControl
 
-# --- Configurações ---
+# --- Configurações de Hardware (Pinos) ---
+PIN_DHT = 23
+PIN_LDR = 34    # Entrada Analógica (ADC1_CH6)
+PIN_PIR = 27    # Entrada Digital
+PIN_RELAY = 2   # Saída Digital (LED Onboard do ESP32 costuma ser no 2 também)
 
-# Wi-Fi
+# --- Configurações de Rede e MQTT ---
 WIFI_SSID = "labiiot"
 WIFI_PASSWORD = "lab@iiot"
+MQTT_BROKER = "10.1.1.101" 
+MQTT_CLIENT_ID = "esp32-smart-house-real"
 
-# Broker MQTT
-MQTT_BROKER = "10.1.1.101"  # Ex: "192.168.1.10"
-MQTT_CLIENT_ID = "esp32-dht22-client"
-MQTT_TOPIC = "/json/4jggok/urn:ngsi-ld:DHT22:001/attrs"
-# Se o seu broker exigir autenticação, descomente e preencha as linhas abaixo
-# MQTT_USER = "seu_usuario"
-# MQTT_PASSWORD = "sua_senha"
+# Tópicos FIWARE
+API_KEY = "house123"
+DEVICE_ID = "esp32_001"
+TOPIC_ATTRS = f"/json/{API_KEY}/{DEVICE_ID}/attrs"
+TOPIC_CMD = f"/json/{API_KEY}/{DEVICE_ID}/cmd"
+TOPIC_CMDEXE = f"/json/{API_KEY}/{DEVICE_ID}/cmdexe"
 
-# Sensor DHT22
-DHT_PIN = 23  # Pino GPIO onde o sensor DHT22 está conectado (ex: D4)
+# Intervalo de leitura
+PUBLISH_INTERVAL = 5
 
-# Intervalo de leitura e publicação (em segundos)
-PUBLISH_INTERVAL = 2
+# --- Lógica de Comandos ---
 
-# --- Lógica Principal ---
+def command_callback(topic, msg):
+    """
+    Executa ações baseadas em comandos recebidos via MQTT.
+    """
+    print(f"\n[COMANDO] Recebido: {msg.decode()}")
+    
+    try:
+        command_data = json.loads(msg.decode())
+        response = {}
+        
+        for cmd_name, cmd_value in command_data.items():
+            # Controle de Atuadores Reais
+            if cmd_name == "lamp":
+                if cmd_value == "on":
+                    relay.on()
+                else:
+                    relay.off()
+                print(f"Relé -> {relay.status()}")
+                response[cmd_name] = "OK"
+            
+            # Simulados (Mantenha se o hardware ainda não estiver lá)
+            elif cmd_name == "door" or cmd_name == "bell":
+                print(f"Atuador Simulado '{cmd_name}' -> {cmd_value}")
+                response[cmd_name] = "OK"
+            
+            else:
+                response[cmd_name] = f"ERROR: '{cmd_name}' não mapeado."
+
+        # Responder ao IoT Agent
+        mqtt.publish(TOPIC_CMDEXE, json.dumps(response))
+
+    except Exception as e:
+        print(f"Erro no processamento de comando: {e}")
+
+# --- Inicialização ---
 
 def main():
-    """
-    Função principal que executa a lógica do dispositivo.
-    """
-    print("Iniciando dispositivo ESP32...")
+    global mqtt, relay
+    
+    print("Iniciando Sistema com Hardware Real...")
 
-    # 1. Conectar ao Wi-Fi
+    # Sensores Reais
+    dht_sensor = DHT22Sensor(PIN_DHT)
+    ldr_sensor = LDRSensor(PIN_LDR)
+    pir_sensor = PIRSensor(PIN_PIR)
+    relay = RelayControl(PIN_RELAY, active_low=False)
+
+    # Conexões
     wifi = WiFiConnector(WIFI_SSID, WIFI_PASSWORD)
     if not wifi.connect():
-        print("Não foi possível conectar ao Wi-Fi. Reiniciando em 10 segundos...")
-        time.sleep(10)
         machine.reset()
 
-    # 2. Inicializar o sensor DHT22
-    sensor = DHT22Sensor(DHT_PIN)
-
-    # 3. Conectar ao Broker MQTT
-    # Certifique-se de passar user e password se o seu broker exigir
     mqtt = MQTTConnector(MQTT_CLIENT_ID, MQTT_BROKER)
+    mqtt.set_callback(command_callback)
+    
     if not mqtt.connect():
-        print("Não foi possível conectar ao broker MQTT. Reiniciando em 10 segundos...")
-        time.sleep(10)
         machine.reset()
 
-    print("\n--- Início da Operação ---")
-    print(f"Publicando dados no tópico: '{MQTT_TOPIC}'")
-    print(f"Intervalo de publicação: {PUBLISH_INTERVAL} segundos")
+    mqtt.subscribe(TOPIC_CMD)
 
-    # 4. Loop principal
+    last_publish = 0
+
+    # --- Loop Principal ---
     while True:
         try:
-            # Ler dados do sensor
-            sensor_data = sensor.read_data()
+            mqtt.check_for_messages()
 
-            if sensor_data:
-                # Formatar payload JSON
-                payload = {
-                    "t": float(f"{sensor_data["temperature"]:.2f}"),
-                    "h": float(f"{sensor_data["humidity"]:.2f}")
-                }
-                payload_str = json.dumps(payload)
+            if (time.time() - last_publish) >= PUBLISH_INTERVAL:
+                # Leituras Reais
+                dht_data = dht_sensor.read_data()
+                luminosity = ldr_sensor.read_luminosity()
+                presence = pir_sensor.is_present()
 
-                # Publicar no MQTT
-                mqtt.publish(MQTT_TOPIC, payload_str)
+                if dht_data:
+                    payload = {
+                        "t": float(f"{dht_data['temperature']:.2f}"),
+                        "h": float(f"{dht_data['humidity']:.2f}"),
+                        "l": luminosity,
+                        "p": presence
+                    }
+                    mqtt.publish(TOPIC_ATTRS, json.dumps(payload))
+                    last_publish = time.time()
             
-            # Aguardar o próximo ciclo
-            print(f"Aguardando {PUBLISH_INTERVAL} segundos para a próxima leitura...")
-            time.sleep(PUBLISH_INTERVAL)
+            time.sleep(0.1)
 
         except KeyboardInterrupt:
-            print("Operação interrompida pelo usuário.")
             break
         except Exception as e:
-            print(f"Ocorreu um erro no loop principal: {e}")
-            print("Tentando se recuperar e continuar...")
-            time.sleep(10) # Pausa antes de tentar novamente
+            print(f"Erro: {e}")
+            time.sleep(5)
 
-    # Desconectar (se o loop for quebrado)
-    mqtt.disconnect()
-    wifi.disconnect()
-    print("Dispositivo finalizado.")
-
-# Ponto de entrada do programa
 if __name__ == "__main__":
     main()

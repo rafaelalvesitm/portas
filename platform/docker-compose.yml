@@ -1,206 +1,197 @@
-# -------------------------------------------------------------------------------------------
-# FIWARE PLATFORM - DOCKER COMPOSE ESTRUTURADO (BOAS PRÁTICAS)
-# -------------------------------------------------------------------------------------------
-# Este arquivo foi otimizado para desenvolvimento e demonstração, incluindo:
-# - Rotação de logs para economia de disco.
-# - Limites de recursos (RAM/CPU) para estabilidade do host.
-# - Organização em camadas (Database, Core, IoT, Apps).
-# -------------------------------------------------------------------------------------------
-
-# Definições Comuns (Anchors) para evitar repetição
-x-logging: &default-logging
-  driver: "json-file"
-  options:
-    max-size: "10m"
-    max-file: "3"
-
-x-resource-limits: &default-limits
-  deploy:
-    resources:
-      limits:
-        cpus: '0.50'
-        memory: 2GB
+# WARNING: Do not deploy this tutorial configuration directly to a production environment
+#
+# The tutorial docker-compose files have not been written for production deployment and will not 
+# scale. A proper architecture has been sacrificed to keep the narrative focused on the learning 
+# goals, they are just used to deploy everything onto a single Docker machine. All FIWARE components 
+# are running at full debug and extra ports have been exposed to allow for direct calls to services. 
+# They also contain various obvious security flaws - passwords in plain text, no load balancing,
+# no use of HTTPS and so on. 
+# 
+# This is all to avoid the need of multiple machines, generating certificates, encrypting secrets
+# and so on, purely so that a single docker-compose file can be read as an example to build on, 
+# not use directly. 
+# 
+# When deploying to a production environment, please refer to the Helm Repository
+# for FIWARE Components in order to scale up to a proper architecture:
+# 
+# see: https://github.com/FIWARE/helm-charts/
+#
 
 services:
-  # =========================================================================================
-  # CAMADA DE DADOS (DATABASES)
-  # =========================================================================================
-  
-  mongo-db:
-    image: mongo:6.0
-    hostname: mongo-db
-    container_name: db-mongo
-    restart: always
-    expose:
-      - "27017"
-    ports:
-      - "27017:27017"
-    networks:
-      - fiware-network
-    volumes:
-      - mongo-db:/data/db
-    logging: *default-logging
-    deploy:
-      resources:
-        limits:
-          memory: 512M
-        reservations:
-          memory: 256M
-    healthcheck:
-      test: ["CMD","mongosh", "--eval", "db.adminCommand('ping')"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-
-  mysql-db:
-    image: mysql:8.0
-    platform: linux/amd64
-    hostname: mysql-db
-    container_name: db-mysql
-    restart: always
-    expose:
-      - "3306"
-    ports:
-      - "3306:3306"
-    networks:
-      - fiware-network
-    environment:
-      - "MYSQL_ROOT_PASSWORD=123"
-      - "MYSQL_ROOT_HOST=%"
-    volumes:
-      - mysql-db:/var/lib/mysql
-    logging: *default-logging
-    deploy:
-      resources:
-        limits:
-          memory: 512M
-        reservations:
-          memory: 256M
-
-  # =========================================================================================
-  # FIWARE CORE (CONTEXT BROKER & PERSISTENCE)
-  # =========================================================================================
-
+  # Orion is an NGSI-v2 context broker
   orion-v2:
-    image: quay.io/fiware/orion:4.1.0
+    labels:
+      org.fiware: 'tutorial'
+    image: quay.io/fiware/orion:${ORION_VERSION}
     hostname: orion
     container_name: fiware-orion
     depends_on:
       - mongo-db
     networks:
-      - fiware-network
+      - default
+    expose:
+      - "${ORION_PORT}"
     ports:
-      - "1026:1026"
-    command: -dbURI mongodb://mongo-db -logLevel DEBUG -noCache
-    logging: *default-logging
-    <<: *default-limits
+      - "${ORION_PORT}:${ORION_PORT}" # localhost:1026
+    command: -dbURI mongodb://mongo-db -logLevel DEBUG
     healthcheck:
-      test: curl --fail -s http://orion:1026/version || exit 1
-      interval: 10s
+      test: curl --fail -s http://orion:${ORION_PORT}/version || exit 1
+      interval: 5s
 
-  cygnus:
-    image: quay.io/fiware/cygnus-ngsi:3.11.0
-    hostname: cygnus
-    container_name: fiware-cygnus
-    depends_on:
-      - mysql-db
-    networks:
-      - fiware-network
-    ports:
-      - "5050:5050"
-      - "5080:5080"
-    environment:
-      - "CYGNUS_MYSQL_SERVICE_PORT=5050"
-      - "CYGNUS_MYSQL_HOST=mysql-db"
-      - "CYGNUS_MYSQL_PORT=3306"
-      - "CYGNUS_MYSQL_USER=root"
-      - "CYGNUS_MYSQL_PASS=123"
-      - "CYGNUS_SERVICE_PORT=5050"
-      - "CYGNUS_API_PORT=5080"
-      - "CYGNUS_LOG_LEVEL=DEBUG"
-    logging: *default-logging
-    <<: *default-limits
-    healthcheck:
-      test: curl --fail -s http://localhost:5080/v1/version || exit 1
-
-  # =========================================================================================
-  # IOT LAYER (AGENTS)
-  # =========================================================================================
-
+  # IoT-Agent is configured for the UltraLight Protocol
   iot-agent:
-    image: quay.io/fiware/iotagent-ul:3.7.0-distroless
+    image: quay.io/fiware/iotagent-json:${JSON_VERSION}
+    labels:
+      org.fiware: 'tutorial'
     hostname: iot-agent
     container_name: fiware-iot-agent
     depends_on:
       - orion-v2
       - mongo-db
     networks:
-      - fiware-network
+      - default
+    expose:
+      - "${IOTA_NORTH_PORT}"
+      - "${IOTA_SOUTH_PORT}"
     ports:
-      - "4041:4041"
-      - "7896:7896"
+      - "${IOTA_NORTH_PORT}:${IOTA_NORTH_PORT}" # localhost:4041
+      - "${IOTA_SOUTH_PORT}:${IOTA_SOUTH_PORT}" # localhost:7896
     environment:
       - IOTA_CB_HOST=orion
-      - IOTA_CB_PORT=1026
-      - IOTA_NORTH_PORT=4041
+      - IOTA_CB_PORT=${ORION_PORT}
+      - IOTA_NORTH_PORT=${IOTA_NORTH_PORT}
       - IOTA_REGISTRY_TYPE=mongodb
       - IOTA_LOG_LEVEL=DEBUG
+      - IOTA_DEFAULT_EXPRESSION_LANGUAGE=jexl
       - IOTA_TIMESTAMP=true
       - IOTA_CB_NGSI_VERSION=v2
       - IOTA_AUTOCAST=true
       - IOTA_MONGO_HOST=mongo-db
-      - IOTA_MONGO_PORT=27017
-      - IOTA_MONGO_DB=iotagentul
-      - IOTA_HTTP_PORT=7896
-      - IOTA_PROVIDER_URL=http://iot-agent:4041
-      - IOTA_MULTI_CORE=true
-      - IOTA_AMQP_DISABLED=true
-      - IOTA_MQTT_DISABLED=false
+      - IOTA_MONGO_PORT=${MONGO_DB_PORT}
+      - IOTA_MONGO_DB=iotagentjson
       - IOTA_MQTT_HOST=mosquitto
       - IOTA_MQTT_PORT=1883
-    logging: *default-logging
-    <<: *default-limits
+      - IOTA_DEFAULT_TRANSPORT=MQTT
+      - IOTA_HTTP_PORT=${IOTA_SOUTH_PORT}
+      - IOTA_PROVIDER_URL=http://iot-agent:${IOTA_NORTH_PORT}
+      - IOTA_DEFAULT_RESOURCE=/iot/json
+      - IOTA_MULTI_CORE=true
+      - IOTA_AMQP_DISABLED=true
     healthcheck:
-      interval: 10s
-      test: curl --fail -s http://localhost:4041/iot/about || exit 1
+      test: curl --fail -s http://localhost:${IOTA_NORTH_PORT}/iot/about || exit 1
+      interval: 5s
 
-  mosquitto:
-    image: eclipse-mosquitto:2.0
-    hostname: mosquitto
-    container_name: fiware-mosquitto
-    restart: always
+  # Database
+  mongo-db:
+    labels:
+      org.fiware: 'tutorial'
+    image: mongo:${MONGO_DB_VERSION}
+    hostname: mongo-db
+    container_name: db-mongo
+    expose:
+      - "${MONGO_DB_PORT}"
+    ports:
+      - "${MONGO_DB_PORT}:${MONGO_DB_PORT}" # localhost:27017
     networks:
-      - fiware-network
+      - default
+    volumes:
+      - mongo-db:/data
+    healthcheck:
+      test: ["CMD","mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  # MQTT Broker
+  mosquitto:
+    image: eclipse-mosquitto:1.6.14
+    hostname: mosquitto
+    container_name: mosquitto
+    expose:
+      - "1883"
+      - "9001"
     ports:
       - "1883:1883"
       - "9001:9001"
-    logging: *default-logging
-    deploy:
-      resources:
-        limits:
-          memory: 256M
-        reservations:
-          memory: 128M
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf
+    networks:
+      - default
+
+  mysql-db:
+    platform: linux/amd64
+    restart: always
+    labels:
+      org.fiware: 'tutorial'
+    image: mysql:${MYSQL_DB_VERSION}
+    hostname: mysql-db
+    container_name: db-mysql
+    expose:
+      - "${MYSQL_DB_PORT}"
+    ports:
+      - "${MYSQL_DB_PORT}:${MYSQL_DB_PORT}" # localhost:3306
+    networks:
+      - default
+    environment:
+      - "MYSQL_ROOT_PASSWORD=123"
+      - "MYSQL_ROOT_HOST=%"
+    volumes:
+      - mysql-db:/var/lib/mysql
+
+  # Cygnus é um agente que conecta o Orion Context Broker a diferentes sistemas de armazenamento
+  cygnus:
+    labels:
+      org.fiware: 'tutorial'
+    image: quay.io/fiware/cygnus-ngsi:${CYGNUS_VERSION}
+    hostname: cygnus
+    container_name: fiware-cygnus
+    networks:
+      - default
+    depends_on:
+      - mysql-db
+    expose:
+      - "${CYGNUS_MYSQL_SERVICE_PORT}"
+      - "${CYGNUS_API_PORT}"
+    ports:
+      - "${CYGNUS_MYSQL_SERVICE_PORT}:${CYGNUS_MYSQL_SERVICE_PORT}" # localhost:5050
+      - "${CYGNUS_API_PORT}:${CYGNUS_API_PORT}" # localhost:5080
+    environment:
+      - "CYGNUS_MYSQL_SERVICE_PORT=${CYGNUS_MYSQL_SERVICE_PORT}" # Notification Port that Cygnus listens when subcribing to context data changes
+      - "CYGNUS_MYSQL_HOST=mysql-db" # Hostname of the MySQL server used to persist historical context data
+      - "CYGNUS_MYSQL_PORT=${MYSQL_DB_PORT}" # Port that the MySQL server uses to listen to commands
+      - "CYGNUS_MYSQL_USER=root" # Username for the MySQL database user
+      - "CYGNUS_MYSQL_PASS=123" # Password for the MySQL database user
+      - "CYGNUS_SERVICE_PORT=${CYGNUS_MYSQL_SERVICE_PORT}"
+      - "CYGNUS_API_PORT=${CYGNUS_API_PORT}" # Port that Cygnus listens on for operational reasons
+      - "CYGNUS_LOG_LEVEL=DEBUG" # The logging level for Cygnus
     healthcheck:
-      test: ["CMD", "mosquitto_sub", "-h", "localhost", "-t", "test", "-C", "1"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
+      test: curl --fail -s http://localhost:${CYGNUS_API_PORT}/v1/version || exit 1
 
-# =========================================================================================
-# INFRAESTRUTURA DE REDE E VOLUMES
-# =========================================================================================
+  grafana:
+    image: grafana/grafana:main-ubuntu
+    hostname: grafana
+    container_name: grafana
+    depends_on:
+      - mysql-db
+    networks:
+      - default
+    ports:
+      - "3000:3000" 
 
+# --- Volumes ---
+volumes:
+  mongo-db: 
+  orion-log:
+  mosquitto-data:
+  mosquitto-log:
+  mysql-db: ~
+
+# --- Redes ---
 networks:
-  fiware-network:
-    name: fiware_network
-    driver: bridge
+  default:
+    labels:
+      org.fiware: 'tutorial'
     ipam:
       config:
         - subnet: 172.18.1.0/24
-
-volumes:
-  mongo-db:
-    name: fiware_mongo_data
-  mysql-db:
-    name: fiware_mysql_data
